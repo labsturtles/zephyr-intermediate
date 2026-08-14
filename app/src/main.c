@@ -1,173 +1,131 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
-LOG_MODULE_REGISTER(demo, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(home_task, LOG_LEVEL_INF);
 
-#define STACK_SIZE 1024
-
-/* Thread priorities */
-#define PRIO_COOP -1
-#define PRIO_HIGH  3
-#define PRIO_MED   5
-#define PRIO_LOW   7
-
+#define STACK_SIZE      1024
+#define THREAD_PRIORITY 5
+#define NUM_INCREMENTS  1000
 
 /*
- * Low priority preemptive thread
+ * Home Task - Synchronization & Shared-State Safety
  *
- * Priority: 7
- * Runs and then sleeps for 300 ms.
+ * The task asks for:
+ *   1. Two equal-priority threads.
+ *   2. Both threads increment the same shared counter.
+ *   3. Observe the race condition.
+ *   4. Fix the race using a mutex.
+ *
+ * Set USE_MUTEX to 0 to reproduce the race condition.
+ * Set USE_MUTEX to 1 for the corrected version.
+ *
+ * The submitted/fixed version uses USE_MUTEX = 1.
  */
-void t_low_fn(void *p1, void *p2, void *p3)
+#define USE_MUTEX 1
+
+static int shared_counter = 0;
+static struct k_mutex counter_mutex;
+
+/*
+ * Each thread performs a read -> modify -> write operation.
+ *
+ * Without the mutex, k_yield() between the read and write makes it
+ * possible for the other thread to read the same old value. One
+ * increment is then lost.
+ */
+static void counter_thread(void *p1, void *p2, void *p3)
 {
-    ARG_UNUSED(p1);
+    const char *name = (const char *)p1;
+
     ARG_UNUSED(p2);
     ARG_UNUSED(p3);
 
-    while (1) {
-        LOG_INF("T_LOW running");
+    for (int i = 0; i < NUM_INCREMENTS; i++) {
 
-        k_msleep(300);
-    }
-}
+#if USE_MUTEX
+        k_mutex_lock(&counter_mutex, K_FOREVER);
+#endif
 
+        /* Explicit read -> modify -> write sequence. */
+        int value = shared_counter;
 
-/*
- * Medium priority preemptive thread
- *
- * Priority: 5
- * Runs and then sleeps for 200 ms.
- */
-void t_med_fn(void *p1, void *p2, void *p3)
-{
-    ARG_UNUSED(p1);
-    ARG_UNUSED(p2);
-    ARG_UNUSED(p3);
-
-    while (1) {
-        LOG_INF("T_MED running");
-
-        k_msleep(200);
-    }
-}
-
-
-/*
- * High priority preemptive thread
- *
- * Priority: 3
- * Runs and then sleeps for 100 ms.
- */
-void t_high_fn(void *p1, void *p2, void *p3)
-{
-    ARG_UNUSED(p1);
-    ARG_UNUSED(p2);
-    ARG_UNUSED(p3);
-
-    while (1) {
-        LOG_INF("T_HIGH running");
-
-        k_msleep(100);
-    }
-}
-
-
-/*
- * Cooperative thread
- *
- * Priority: -1
- *
- * Performs 5 iterations of busy work and then yields.
- */
-void t_coop_fn(void *p1, void *p2, void *p3)
-{
-    ARG_UNUSED(p1);
-    ARG_UNUSED(p2);
-    ARG_UNUSED(p3);
-
-    while (1) {
-
-        LOG_INF("T_COOP starting busy work");
-
-        for (int i = 0; i < 5; i++) {
-
-            volatile uint32_t work = 0;
-
-            for (uint32_t j = 0; j < 10000; j++) {
-                work += j;
-            }
-
-            ARG_UNUSED(work);
-
-            LOG_INF("T_COOP busy iteration %d", i + 1);
-        }
-
-        LOG_INF("T_COOP yielding");
-
+#if !USE_MUTEX
+        /* Deliberately expose the race between read and write. */
         k_yield();
+#endif
+
+        value++;
+        shared_counter = value;
+
+#if USE_MUTEX
+        k_mutex_unlock(&counter_mutex);
+#endif
+
+        /* Yield outside the critical section. */
+        if ((i % 10) == 0) {
+            k_yield();
+        }
     }
+
+    LOG_INF("%s finished", name);
 }
 
-
-/*
- * Thread definitions
- */
-
+/* Two threads with exactly the same priority. */
 K_THREAD_DEFINE(
-    t_low,
+    counter_thread_a,
     STACK_SIZE,
-    t_low_fn,
+    counter_thread,
+    "T_A",
     NULL,
     NULL,
-    NULL,
-    PRIO_LOW,
+    THREAD_PRIORITY,
     0,
     0
 );
 
 K_THREAD_DEFINE(
-    t_med,
+    counter_thread_b,
     STACK_SIZE,
-    t_med_fn,
+    counter_thread,
+    "T_B",
     NULL,
     NULL,
-    NULL,
-    PRIO_MED,
+    THREAD_PRIORITY,
     0,
     0
 );
 
-K_THREAD_DEFINE(
-    t_high,
-    STACK_SIZE,
-    t_high_fn,
-    NULL,
-    NULL,
-    NULL,
-    PRIO_HIGH,
-    0,
-    0
-);
-
-K_THREAD_DEFINE(
-    t_coop,
-    STACK_SIZE,
-    t_coop_fn,
-    NULL,
-    NULL,
-    NULL,
-    PRIO_COOP,
-    0,
-    0
-);
-
-
-/*
- * Main application
- */
 int main(void)
 {
-    LOG_INF("Starting thread scheduling task");
+    LOG_INF("========================================");
+    LOG_INF("L2 Task 1 - Shared Counter");
+    LOG_INF("Two equal-priority threads");
+#if USE_MUTEX
+    LOG_INF("Synchronization: MUTEX ENABLED");
+#else
+    LOG_INF("Synchronization: MUTEX DISABLED");
+    LOG_INF("Race condition demonstration");
+#endif
+    LOG_INF("Expected final counter: %d", 2 * NUM_INCREMENTS);
+    LOG_INF("========================================");
+
+    k_mutex_init(&counter_mutex);
+
+    /* Wait until both worker threads have completed. */
+    k_thread_join(counter_thread_a, K_FOREVER);
+    k_thread_join(counter_thread_b, K_FOREVER);
+
+    LOG_INF("----------------------------------------");
+    LOG_INF("Final counter = %d", shared_counter);
+    LOG_INF("Expected      = %d", 2 * NUM_INCREMENTS);
+
+    if (shared_counter == (2 * NUM_INCREMENTS)) {
+        LOG_INF("RESULT: PASS - no increments were lost");
+    } else {
+        LOG_INF("RESULT: RACE CONDITION - increments were lost");
+    }
+
+    LOG_INF("----------------------------------------");
 
     return 0;
 }
