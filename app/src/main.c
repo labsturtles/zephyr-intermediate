@@ -1,8 +1,23 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/task_wdt/task_wdt.h>
+#include <zephyr/tracing/tracing.h>
 
-LOG_MODULE_REGISTER(l5_task1, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(homework, LOG_LEVEL_INF);
+
+
+/*
+ * ============================================================================
+ * L6 HOMEWORK - SCHEDULING DELAY INVESTIGATION
+ * ============================================================================
+ *
+ * Response-time guarantee:
+ *
+ *   The control thread must start processing each event within 10 ms
+ *   from the time the timer creates the event.
+ *
+ * The application measures this latency for every sequence and counts
+ * every deadline miss.
+ */
 
 
 /*
@@ -11,327 +26,310 @@ LOG_MODULE_REGISTER(l5_task1, LOG_LEVEL_INF);
  * ============================================================================
  */
 
-/* Message queue configuration */
-#define QUEUE_DEPTH             8
+#define STACK_SIZE                 2048
 
-/* Producer creates one sample every 200 ms */
-#define PRODUCER_PERIOD_MS      200
+#define EVENT_PERIOD_MS             250
+#define MAINTENANCE_LOAD_US       45000
 
-/* Normal consumer processing time */
-#define CONSUMER_PROCESS_MS     100
+#define CONTROL_DEADLINE_MS           10
+
 
 /*
- * Simulated consumer stall.
+ * Set this value to:
  *
- * The watchdog timeout is shorter than this value, so the watchdog callback
- * will be triggered while the consumer is sleeping.
+ *   0 -> Original configuration (BEFORE correction)
+ *   1 -> Corrected configuration (AFTER correction)
+ *
+ * Only one cause is changed: thread priority.
  */
-#define CONSUMER_STUCK_MS       5000
-
-/* Consumer will simulate a failure after processing this many samples */
-#define STUCK_AFTER_SAMPLES     10
-
-/* Task watchdog timeout */
-#define CONSUMER_WDT_TIMEOUT_MS 2000
-
-/* Health-check period */
-#define HEALTH_CHECK_PERIOD_MS  250
+#define APPLY_SCHEDULING_FIX            1
 
 
 /*
- * Thread configuration.
+ * Original configuration:
+ *
+ *   maintenance priority = 4
+ *   control priority     = 7
+ *
+ * In Zephyr, a lower numerical value means a higher scheduling priority.
+ *
+ * Therefore, the maintenance thread can run before the time-critical
+ * control thread.
+ *
+ * Corrected configuration:
+ *
+ *   control priority     = 4
+ *   maintenance priority = 7
  */
-#define PRODUCER_STACK_SIZE     1024
-#define CONSUMER_STACK_SIZE     1024
-#define HEALTH_STACK_SIZE       1024
+#if APPLY_SCHEDULING_FIX
 
-#define PRODUCER_PRIORITY       5
-#define CONSUMER_PRIORITY       5
-#define HEALTH_PRIORITY         6
+#define CONTROL_PRIORITY              4
+#define MAINTENANCE_PRIORITY          7
+
+#else
+
+#define CONTROL_PRIORITY              7
+#define MAINTENANCE_PRIORITY          4
+
+#endif
 
 
 /*
  * ============================================================================
- * SENSOR MESSAGE
+ * CONTROL EVENT
  * ============================================================================
+ *
+ * Each event contains:
+ *
+ *   seq      -> stable sequence identifier
+ *   ready_ms -> timestamp when the event became available
  */
 
-struct sensor_data {
-	uint32_t sequence;
-	int32_t temperature_mc;
-	uint32_t timestamp_ms;
+struct control_event {
+	uint32_t seq;
+	uint32_t ready_ms;
 };
 
 
 /*
- * ============================================================================
- * MESSAGE QUEUE
- * ============================================================================
- *
- * The queue contains copies of struct sensor_data.
- *
- * Depth = 8 messages.
+ * Queue used by the producer/consumer pipeline.
  */
-
-K_MSGQ_DEFINE(sensor_queue,
-	      sizeof(struct sensor_data),
-	      QUEUE_DEPTH,
+K_MSGQ_DEFINE(control_queue,
+	      sizeof(struct control_event),
+	      4,
 	      4);
 
 
 /*
- * ============================================================================
- * THREAD OBJECTS
- * ============================================================================
+ * Semaphore used to activate the maintenance thread.
  */
-
-K_THREAD_STACK_DEFINE(producer_stack, PRODUCER_STACK_SIZE);
-K_THREAD_STACK_DEFINE(consumer_stack, CONSUMER_STACK_SIZE);
-K_THREAD_STACK_DEFINE(health_stack, HEALTH_STACK_SIZE);
-
-static struct k_thread producer_thread_data;
-static struct k_thread consumer_thread_data;
-static struct k_thread health_thread_data;
+K_SEM_DEFINE(maintenance_start, 0, 1);
 
 
 /*
- * Task watchdog channel used to supervise the consumer thread.
+ * Deadline statistics.
  */
-static int consumer_wdt_channel = -1;
+static uint32_t deadline_misses;
+static uint32_t events_processed;
+static uint32_t max_latency_ms;
 
 
 /*
  * ============================================================================
- * TASK WATCHDOG CALLBACK
+ * TIMER EXPIRY - EVENT PRODUCER
  * ============================================================================
  *
- * This callback is executed when the consumer does not feed its task watchdog
- * before the configured timeout expires.
+ * The timer callback creates one control event.
+ *
+ * The callback executes in interrupt context, therefore it must never block.
  */
 
-static void consumer_wdt_callback(int channel_id, void *user_data)
+static void event_timer_expiry(struct k_timer *timer)
 {
-	ARG_UNUSED(user_data);
+	static uint32_t seq;
 
-	LOG_ERR("================================================");
-	LOG_ERR("TASK WATCHDOG FIRED!");
-	LOG_ERR("Consumer thread is not responding");
-	LOG_ERR("Watchdog channel: %d", channel_id);
-	LOG_ERR("================================================");
-}
+	struct control_event event = {
+		.seq = seq++,
+		.ready_ms = k_uptime_get_32(),
+	};
+
+	ARG_UNUSED(timer);
 
 
-/*
- * ============================================================================
- * PRODUCER THREAD
- * ============================================================================
- *
- * Generates sensor samples periodically and tries to insert them into the
- * message queue.
- *
- * K_NO_WAIT is used intentionally so that the producer does not block when
- * the queue becomes full.
- */
+	/*
+	 * Insert the event without waiting because this function executes
+	 * in interrupt context.
+	 */
+	int ret = k_msgq_put(&control_queue, &event, K_NO_WAIT);
 
-static void producer_thread(void *p1, void *p2, void *p3)
-{
-	struct sensor_data data;
-	uint32_t sequence = 0;
-	int ret;
-
-	ARG_UNUSED(p1);
-	ARG_UNUSED(p2);
-	ARG_UNUSED(p3);
-
-	LOG_INF("PRODUCER thread started");
-
-	while (1) {
-
-		data.sequence = sequence;
-
-		/*
-		 * Generate a simulated temperature.
-		 *
-		 * 24000 mC = 24.0 degrees C.
-		 */
-		data.temperature_mc =
-			24000 + ((sequence % 10) * 100);
-
-		data.timestamp_ms = k_uptime_get_32();
-
-		/*
-		 * Try to add the sample without blocking.
-		 */
-		ret = k_msgq_put(&sensor_queue, &data, K_NO_WAIT);
-
-		if (ret == 0) {
-			LOG_INF("PRODUCER: sample %u -> %d mC",
-				data.sequence,
-				data.temperature_mc);
-		} else {
-			/*
-			 * The queue is full.
-			 *
-			 * Drop the newest sample instead of blocking the producer.
-			 */
-			LOG_WRN("PRODUCER: queue FULL - dropping sample %u",
-				data.sequence);
-		}
-
-		sequence++;
-
-		k_msleep(PRODUCER_PERIOD_MS);
+	if (ret != 0) {
+		return;
 	}
+
+
+	/*
+	 * Generate an application trace event.
+	 *
+	 * This provides a stable sequence identifier that can later be
+	 * correlated with scheduler events in the CTF trace.
+	 */
+	sys_trace_named_event(
+		"event_ready",
+		event.seq,
+		k_msgq_num_used_get(&control_queue)
+	);
+
+
+	/*
+	 * Both the control and maintenance threads become ready when the
+	 * timer interrupt returns.
+	 */
+	k_sem_give(&maintenance_start);
 }
+
+
+K_TIMER_DEFINE(event_timer, event_timer_expiry, NULL);
 
 
 /*
  * ============================================================================
- * CONSUMER THREAD
+ * CONTROL THREAD
  * ============================================================================
  *
- * The consumer normally receives and processes messages from the queue.
+ * This is the time-critical consumer.
  *
- * After STUCK_AFTER_SAMPLES messages it intentionally performs a long sleep,
- * simulating a stuck or unresponsive consumer.
+ * Response-time guarantee:
  *
- * While the consumer is sleeping:
- *
- *   - the producer continues producing data
- *   - the queue begins to fill
- *   - the health-check thread detects high queue usage
- *   - the task watchdog expires
+ *     event ready -> control processing start <= 10 ms
  */
 
-static void consumer_thread(void *p1, void *p2, void *p3)
+static void control_fn(void *p1, void *p2, void *p3)
 {
-	struct sensor_data data;
-	uint32_t processed_samples = 0;
-	bool stuck_simulated = false;
-	int ret;
-
 	ARG_UNUSED(p1);
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
-	LOG_INF("CONSUMER thread started");
+	while (true) {
 
-	while (1) {
+		struct control_event event;
 
-		/*
-		 * Wait indefinitely for the next message.
-		 */
-		ret = k_msgq_get(&sensor_queue, &data, K_FOREVER);
+		int ret = k_msgq_get(
+			&control_queue,
+			&event,
+			K_FOREVER
+		);
 
 		if (ret != 0) {
-			LOG_ERR("CONSUMER: k_msgq_get() failed: %d", ret);
+			LOG_ERR("[CONTROL] receive failed: %d", ret);
 			continue;
 		}
 
-		LOG_INF("CONSUMER: sample %u -> %d mC",
-			data.sequence,
-			data.temperature_mc);
-
-		processed_samples++;
 
 		/*
-		 * Feed the task watchdog because the consumer is alive and
-		 * successfully processing data.
+		 * Measure the response time from event creation until the
+		 * control thread starts processing it.
 		 */
-		if (consumer_wdt_channel >= 0) {
-			ret = task_wdt_feed(consumer_wdt_channel);
+		uint32_t now_ms = k_uptime_get_32();
+		uint32_t latency_ms = now_ms - event.ready_ms;
 
-			if (ret != 0) {
-				LOG_ERR("CONSUMER: task_wdt_feed() failed: %d",
-					ret);
-			}
+		events_processed++;
+
+
+		/*
+		 * Track the maximum observed latency.
+		 */
+		if (latency_ms > max_latency_ms) {
+			max_latency_ms = latency_ms;
 		}
 
+
 		/*
-		 * Simulate the consumer becoming stuck.
+		 * Sequence-based structured log.
+		 */
+		LOG_INF(
+			"event_done seq=%u latency_ms=%u misses=%u max_ms=%u",
+			event.seq,
+			latency_ms,
+			deadline_misses,
+			max_latency_ms
+		);
+
+
+		/*
+		 * Count every deadline violation.
 		 *
-		 * This is done only once so that the application can recover
-		 * after the demonstration.
+		 * The counter is always updated, while the warning output is
+		 * rate-limited to reduce diagnostic overhead.
 		 */
-		if (!stuck_simulated &&
-		    processed_samples >= STUCK_AFTER_SAMPLES) {
+		if (latency_ms > CONTROL_DEADLINE_MS) {
 
-			stuck_simulated = true;
+			deadline_misses++;
 
-			LOG_WRN("================================================");
-			LOG_WRN("CONSUMER: SIMULATING STUCK THREAD");
-			LOG_WRN("CONSUMER: sleeping for %d ms",
-				CONSUMER_STUCK_MS);
-			LOG_WRN("================================================");
-
-			/*
-			 * No watchdog feed occurs during this sleep.
-			 */
-			k_msleep(CONSUMER_STUCK_MS);
-
-			LOG_INF("CONSUMER: recovered from simulated stall");
-
-			/*
-			 * Feed the watchdog immediately after recovery.
-			 */
-			if (consumer_wdt_channel >= 0) {
-				task_wdt_feed(consumer_wdt_channel);
-			}
+			LOG_WRN_RATELIMIT(
+				"deadline_miss count=%u seq=%u latency_ms=%u",
+				deadline_misses,
+				event.seq,
+				latency_ms
+			);
 		}
 
+
 		/*
-		 * Simulate normal processing time.
+		 * Generate a completion trace event.
 		 */
-		k_msleep(CONSUMER_PROCESS_MS);
+		sys_trace_named_event(
+			"event_done",
+			event.seq,
+			latency_ms
+		);
 	}
 }
 
 
 /*
  * ============================================================================
- * HEALTH-CHECK THREAD
+ * BACKGROUND MAINTENANCE THREAD
  * ============================================================================
  *
- * Periodically checks the queue fill level.
+ * This work is CPU intensive but does not have a short response-time
+ * requirement.
  *
- * The homework requires a warning when the queue reaches 75% capacity.
- *
- * Queue depth = 8
- *
- * 75% of 8 = 6 messages
+ * The original application intentionally gives this thread a higher
+ * priority than the control thread.
  */
 
-static void health_thread(void *p1, void *p2, void *p3)
+static void maintenance_fn(void *p1, void *p2, void *p3)
 {
-	uint32_t used;
-	uint32_t percentage;
-
 	ARG_UNUSED(p1);
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
-	LOG_INF("HEALTH-CHECK thread started");
+	while (true) {
 
-	while (1) {
+		k_sem_take(
+			&maintenance_start,
+			K_FOREVER
+		);
 
-		used = k_msgq_num_used_get(&sensor_queue);
-
-		percentage = (used * 100U) / QUEUE_DEPTH;
 
 		/*
-		 * Log a warning when queue usage reaches 75%.
+		 * Simulate CPU-intensive maintenance work.
 		 */
-		if (used >= ((QUEUE_DEPTH * 3U) / 4U)) {
-
-			LOG_WRN("HEALTH: queue at %u/%u (%u%%)",
-				used,
-				QUEUE_DEPTH,
-				percentage);
-		}
-
-		k_msleep(HEALTH_CHECK_PERIOD_MS);
+		k_busy_wait(MAINTENANCE_LOAD_US);
 	}
 }
+
+
+/*
+ * ============================================================================
+ * THREAD DEFINITIONS
+ * ============================================================================
+ */
+
+K_THREAD_DEFINE(
+	control,
+	STACK_SIZE,
+	control_fn,
+	NULL,
+	NULL,
+	NULL,
+	CONTROL_PRIORITY,
+	0,
+	0
+);
+
+
+K_THREAD_DEFINE(
+	maintenance,
+	STACK_SIZE,
+	maintenance_fn,
+	NULL,
+	NULL,
+	NULL,
+	MAINTENANCE_PRIORITY,
+	0,
+	0
+);
 
 
 /*
@@ -342,104 +340,54 @@ static void health_thread(void *p1, void *p2, void *p3)
 
 int main(void)
 {
-	int ret;
+	LOG_INF("================================================");
+	LOG_INF("L6 TASK 1 - SCHEDULING DELAY INVESTIGATION");
+	LOG_INF("================================================");
 
-	LOG_INF("==============================================");
-	LOG_INF("L5 TASK 1 - RELIABILITY UNDER PRESSURE");
-	LOG_INF("==============================================");
+	LOG_INF(
+		"Response-time guarantee: control <= %d ms",
+		CONTROL_DEADLINE_MS
+	);
 
-	LOG_INF("Queue depth       : %d", QUEUE_DEPTH);
-	LOG_INF("Producer period   : %d ms", PRODUCER_PERIOD_MS);
-	LOG_INF("Consumer WDT      : %d ms", CONSUMER_WDT_TIMEOUT_MS);
-	LOG_INF("Consumer stall    : %d ms", CONSUMER_STUCK_MS);
+	LOG_INF(
+		"Control priority     : %d",
+		CONTROL_PRIORITY
+	);
 
-	/*
-	 * Initialize the task watchdog.
-	 *
-	 * NULL means that no hardware watchdog is used as fallback.
-	 * This exercise uses the software task watchdog only.
-	 */
-	ret = task_wdt_init(NULL);
+	LOG_INF(
+		"Maintenance priority : %d",
+		MAINTENANCE_PRIORITY
+	);
 
-	if (ret != 0) {
-		LOG_ERR("task_wdt_init() failed: %d", ret);
-		return 0;
-	}
-
-	LOG_INF("Task watchdog initialized");
-
-	/*
-	 * Register a watchdog channel for the consumer.
-	 *
-	 * The consumer must feed this watchdog periodically.
-	 */
-	consumer_wdt_channel =
-		task_wdt_add(CONSUMER_WDT_TIMEOUT_MS,
-			     consumer_wdt_callback,
-			     NULL);
-
-	if (consumer_wdt_channel < 0) {
-		LOG_ERR("task_wdt_add() failed: %d",
-			consumer_wdt_channel);
-		return 0;
-	}
-
-	LOG_INF("Consumer watchdog channel: %d",
-		consumer_wdt_channel);
-
-
-	/*
-	 * Create the producer thread.
-	 */
-	k_thread_create(
-		&producer_thread_data,
-		producer_stack,
-		K_THREAD_STACK_SIZEOF(producer_stack),
-		producer_thread,
-		NULL,
-		NULL,
-		NULL,
-		PRODUCER_PRIORITY,
-		0,
-		K_NO_WAIT
+	LOG_INF(
+		"Maintenance load     : %d us",
+		MAINTENANCE_LOAD_US
 	);
 
 
-	/*
-	 * Create the consumer thread.
-	 */
-	k_thread_create(
-		&consumer_thread_data,
-		consumer_stack,
-		K_THREAD_STACK_SIZEOF(consumer_stack),
-		consumer_thread,
-		NULL,
-		NULL,
-		NULL,
-		CONSUMER_PRIORITY,
-		0,
-		K_NO_WAIT
-	);
+#if APPLY_SCHEDULING_FIX
+
+	LOG_INF("Test configuration   : AFTER correction");
+
+#else
+
+	LOG_INF("Test configuration   : BEFORE correction");
+
+#endif
+
+
+	LOG_INF("Starting event timer...");
 
 
 	/*
-	 * Create the health-check thread.
+	 * Start after 500 ms and generate one event every 250 ms.
 	 */
-	k_thread_create(
-		&health_thread_data,
-		health_stack,
-		K_THREAD_STACK_SIZEOF(health_stack),
-		health_thread,
-		NULL,
-		NULL,
-		NULL,
-		HEALTH_PRIORITY,
-		0,
-		K_NO_WAIT
+	k_timer_start(
+		&event_timer,
+		K_MSEC(500),
+		K_MSEC(EVENT_PERIOD_MS)
 	);
 
-
-	LOG_INF("All threads started");
 
 	return 0;
 }
