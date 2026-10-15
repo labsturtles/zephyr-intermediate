@@ -9,13 +9,12 @@
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/fff.h>
 
-/* TODO(l8-task0): declare fake_sensor_sample_fetch, the FFF fake for
- * sensor_driver_api.sample_fetch. See HOMEWORK.md, Task 0.
+/*
+ * Fake for sensor_driver_api.sample_fetch.
+ *
+ * Called when the temperature alarm requests
+ * a new sensor sample.
  */
-
-/* FFF fake for sensor_driver_api.channel_get. */
-DECLARE_FAKE_VALUE_FUNC(int, fake_sensor_channel_get, const struct device *, enum sensor_channel, struct sensor_value *);
-
 DECLARE_FAKE_VALUE_FUNC(
     int,
     fake_sensor_sample_fetch,
@@ -23,20 +22,41 @@ DECLARE_FAKE_VALUE_FUNC(
     enum sensor_channel
 );
 
-/** The fake sensor device the tests pass to temp_alarm_init(). */
+/*
+ * Fake for sensor_driver_api.channel_get.
+ *
+ * Called when the temperature alarm reads
+ * the temperature value.
+ */
+DECLARE_FAKE_VALUE_FUNC(
+    int,
+    fake_sensor_channel_get,
+    const struct device *,
+    enum sensor_channel,
+    struct sensor_value *
+);
+
+/*
+ * Fake sensor device passed to temp_alarm_init().
+ */
 extern struct device fake_sensor_dev;
 
-/** @brief Set the temperature, in whole degrees Celsius, that channel_get returns. */
+/*
+ * Set the simulated temperature in degrees Celsius.
+ */
 void sensor_fake_set_temperature(int temp_celsius);
 
-/**
- * @brief Install the custom_fake on fake_sensor_channel_get.
+/*
+ * Install the custom implementation for channel_get.
  *
- * Call it after sensor_fake_reset(), because RESET_FAKE() clears custom_fake.
+ * Call after sensor_fake_reset(), because RESET_FAKE()
+ * clears the custom_fake callback.
  */
 void sensor_fake_init(void);
 
-/** @brief Reset every FFF fake, the call history and the simulated temperature. */
+/*
+ * Reset all FFF fakes, call history and temperature.
+ */
 void sensor_fake_reset(void);
 
 #endif /* SENSOR_FAKE_H */
