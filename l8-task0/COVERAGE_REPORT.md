@@ -27,7 +27,7 @@ Testing environment:
 
 ## Task 1 - Happy-Path Tests
 
-Git tag: `v1.0.8-l8t1-course2026`
+Git tag: `l8-task1`
 
 The initial tests verified normal module behavior,
 including temperature thresholds, alarm activation,
@@ -44,7 +44,7 @@ HTML report: [Task 1 Coverage](coverage-task1/index.html)
 
 ## Task 2 - Error-Path Tests
 
-Git tag: `v1.0.8-l8t2-course2026`
+Git tag: `l8-task2`
 
 Additional tests verified:
 - Sensor sample-fetch failures
@@ -59,7 +59,7 @@ that were not covered by the happy-path tests.
 
 ## Task 3 - Final Coverage
 
-Git tag: `v1.0.8-l8t3-course2026`
+Git tag: `l8-task3`
 
 Final results:
 - Lines: 100%
